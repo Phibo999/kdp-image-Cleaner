@@ -1,1 +1,1 @@
-https://web-production-66b71f.up.railway.app/
+web: python -m uvicorn app:app --host 0.0.0.0 --port $PORT
