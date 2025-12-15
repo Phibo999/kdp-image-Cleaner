@@ -1,23 +1,27 @@
 FROM python:3.11-slim
 
-WORKDIR /app
-
+# Installer les dépendances système requises par Cairo / Pillow / OpenCV
 RUN apt-get update && apt-get install -y \
     libcairo2 \
+    libcairo2-dev \
     libpango-1.0-0 \
     libpangocairo-1.0-0 \
-    libgdk-pixbuf-2.0-0 \
-    libffi8 \
-    shared-mime-info \
+    libjpeg-dev \
+    libpng-dev \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
     build-essential \
-    libgl1 \
     && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+COPY app.py .
 
-ENV PYTHONUNBUFFERED=1
+ENV PORT=8080
 
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "app:app"]
+CMD ["gunicorn", "-w", "2", "-b", "0.0.0.0:8080", "app:app"]
