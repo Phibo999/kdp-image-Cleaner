@@ -251,85 +251,66 @@ def list_formats():
 @app.route('/svg_to_png', methods=['POST'])
 def svg_to_png():
     """
-    Convertit un SVG (URL) en PNG binaire, redimensionné au format KDP (dpi) + marges.
-
-    Body JSON attendu (compatible Make):
-    {
-      "svg_url": "https://....svg",
-      "format": "8.5x11",
-      "dpi": 300,
-      "margins_mm": 0
-    }
-
-    Retour: image/png (binaire)
+    Convertit un SVG en PNG KDP-ready (Make compatible)
+    Reçoit JSON, renvoie PNG binaire
     """
     try:
-        data = request.get_json(silent=True) or {}
-        svg_url = data.get("svg_url") or data.get("input_url")  # tolérance si tu réutilises un champ
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "No JSON body"}), 400
+
+        svg_url = data.get("svg_url")
         format_kdp = data.get("format", "8.5x11")
-        dpi = int(data.get("dpi", 300) or 300)
-        margins_mm = float(data.get("margins_mm", 0) or 0)
+        dpi = int(data.get("dpi", 300))
+        margins_mm = int(data.get("margins_mm", 0))
 
         if not svg_url:
             return jsonify({"error": "svg_url is required"}), 400
 
-        # bornes de sécurité
-        if dpi < 72:
-            dpi = 72
-        if dpi > 600:
-            dpi = 600
-        if margins_mm < 0:
-            margins_mm = 0
+        # Télécharger le SVG
+        r = requests.get(svg_url, timeout=60)
+        r.raise_for_status()
+        svg_data = r.content
 
-        target_w, target_h = kdp_target_pixels(format_kdp, dpi)
+        # Dimensions KDP
+        if format_kdp not in KDP_FORMATS:
+            return jsonify({"error": "Invalid format"}), 400
 
-        # marges en pixels
-        margin_px = int(round(margins_mm * dpi / 25.4))
-        usable_w = max(1, target_w - 2 * margin_px)
-        usable_h = max(1, target_h - 2 * margin_px)
+        target = KDP_FORMATS[format_kdp]
+        width_px = target["width"]
+        height_px = target["height"]
 
-        # download svg
-        svg_bytes = download_bytes(svg_url)
+        # Marges
+        margin_px = int(margins_mm * dpi / 25.4)
+        usable_w = width_px - (2 * margin_px)
+        usable_h = height_px - (2 * margin_px)
 
-        # calc ratio pour "contain"
-        ratio = parse_svg_ratio(svg_bytes)
-        target_ratio = usable_w / usable_h
-
-        if ratio > target_ratio:
-            render_w = usable_w
-            render_h = max(1, int(round(usable_w / ratio)))
-        else:
-            render_h = usable_h
-            render_w = max(1, int(round(usable_h * ratio)))
-
-        # render SVG -> PNG (RGBA)
-        rendered_png = cairosvg.svg2png(
-            bytestring=svg_bytes,
-            output_width=render_w,
-            output_height=render_h
+        # Conversion SVG → PNG
+        png_bytes = cairosvg.svg2png(
+            bytestring=svg_data,
+            output_width=usable_w,
+            output_height=usable_h,
+            dpi=dpi,
+            background_color="white"
         )
 
-        # compose sur un fond blanc KDP
-        fg = Image.open(BytesIO(rendered_png)).convert("RGBA")
-        canvas = Image.new("RGB", (target_w, target_h), (255, 255, 255))
+        # Charger image
+        img = Image.open(BytesIO(png_bytes)).convert("L")
 
-        x = (target_w - fg.width) // 2
-        y = (target_h - fg.height) // 2
+        # Canvas final KDP
+        final_img = Image.new("L", (width_px, height_px), 255)
+        x = (width_px - img.width) // 2
+        y = (height_px - img.height) // 2
+        final_img.paste(img, (x, y))
 
-        # alpha composite
-        canvas.paste(fg, (x, y), fg)
+        buf = BytesIO()
+        final_img.save(buf, format="PNG", optimize=True)
+        buf.seek(0)
 
-        out = BytesIO()
-        canvas.save(out, format="PNG", optimize=True)
-        out.seek(0)
+        return send_file(buf, mimetype="image/png")
 
-        return send_file(out, mimetype="image/png", as_attachment=False)
-
-    except requests.exceptions.RequestException as e:
-        return jsonify({"error": f"Failed to download svg: {str(e)}"}), 400
     except Exception as e:
-        return jsonify({"error": f"svg_to_png processing error: {str(e)}"}), 500
-
+        return jsonify({"error": str(e)}), 500
 def download_svg(url: str) -> bytes:
     """Télécharge un SVG depuis une URL et retourne les bytes."""
     r = requests.get(url, timeout=60)
