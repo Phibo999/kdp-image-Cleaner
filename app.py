@@ -330,6 +330,142 @@ def svg_to_png():
     except Exception as e:
         return jsonify({"error": f"svg_to_png processing error: {str(e)}"}), 500
 
+def download_svg(url: str) -> bytes:
+    """Télécharge un SVG depuis une URL et retourne les bytes."""
+    r = requests.get(url, timeout=60)
+    r.raise_for_status()
+    return r.content
+
+def _normalize_dpi(dpi):
+    try:
+        dpi = int(dpi)
+    except Exception:
+        dpi = 300
+    return max(72, min(dpi, 1200))  # bornes raisonnables
+
+def _normalize_margins_mm(margins_mm):
+    try:
+        margins_mm = float(margins_mm)
+    except Exception:
+        margins_mm = 0.0
+    return max(0.0, min(margins_mm, 25.0))  # bornes raisonnables
+
+def svg_bytes_to_pil(svg_bytes: bytes, dpi: int) -> Image.Image:
+    """
+    Convertit un SVG en PIL.Image via CairoSVG.
+    Retourne une image RGBA.
+    """
+    png_bytes = cairosvg.svg2png(bytestring=svg_bytes, dpi=dpi)
+    return Image.open(BytesIO(png_bytes)).convert("RGBA")
+
+def fit_on_kdp_canvas(img_rgba: Image.Image, format_kdp: str, dpi: int, margins_mm: float) -> Image.Image:
+    """
+    Place l'image rendue (RGBA) au centre d'une page KDP (fond blanc),
+    en respectant format + dpi + marges, en conservant le ratio.
+    Retourne une image L (niveaux de gris) prête à binariser.
+    """
+    # Dimensions page en px pour le dpi demandé
+    # On part de tes formats définis en 300dpi, puis on scale au dpi voulu.
+    if format_kdp not in KDP_FORMATS:
+        format_kdp = "8.5x11"
+
+    base = KDP_FORMATS[format_kdp]
+    scale = dpi / 300.0
+    page_w = int(round(base["width"] * scale))
+    page_h = int(round(base["height"] * scale))
+
+    margin_px = int(round(margins_mm * dpi / 25.4))
+    usable_w = max(1, page_w - 2 * margin_px)
+    usable_h = max(1, page_h - 2 * margin_px)
+
+    # Aplatir sur fond blanc
+    white_bg = Image.new("RGBA", img_rgba.size, (255, 255, 255, 255))
+    flat = Image.alpha_composite(white_bg, img_rgba).convert("RGB")
+
+    # Fit dans zone utilisable
+    img_ratio = flat.width / max(1, flat.height)
+    zone_ratio = usable_w / max(1, usable_h)
+
+    if img_ratio > zone_ratio:
+        new_w = usable_w
+        new_h = int(round(usable_w / img_ratio))
+    else:
+        new_h = usable_h
+        new_w = int(round(usable_h * img_ratio))
+
+    resized = flat.resize((max(1, new_w), max(1, new_h)), Image.Resampling.LANCZOS)
+
+    # Canvas final
+    canvas = Image.new("RGB", (page_w, page_h), (255, 255, 255))
+    x = (page_w - resized.width) // 2
+    y = (page_h - resized.height) // 2
+    canvas.paste(resized, (x, y))
+
+    return canvas.convert("L")
+
+def binarize_strict(img_l: Image.Image, threshold: int = 245) -> Image.Image:
+    """
+    Binarisation agressive pour supprimer l’anti-aliasing (gris) issu du rendu SVG.
+    0 = noir, 255 = blanc.
+    """
+    arr = np.array(img_l)
+    arr = np.where(arr < threshold, 0, 255).astype(np.uint8)
+    return Image.fromarray(arr, mode="L")
+
+@app.route('/svg_to_png', methods=['POST'])
+def svg_to_png():
+    """
+    Convertit un SVG (URL) en PNG binaire, KDP-ready.
+
+    Body JSON attendu:
+    {
+      "svg_url": "https://drive.google.com/uc?id=...&export=download",
+      "format": "8.5x11",
+      "dpi": 300,
+      "margins_mm": 0,
+      "binarize": true,
+      "threshold": 245
+    }
+    """
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "No JSON data provided"}), 400
+
+        svg_url = data.get("svg_url")
+        format_kdp = data.get("format", "8.5x11")
+        dpi = _normalize_dpi(data.get("dpi", 300))
+        margins_mm = _normalize_margins_mm(data.get("margins_mm", 0))
+        binarize = bool(data.get("binarize", True))
+        threshold = int(data.get("threshold", 245))
+
+        if not svg_url:
+            return jsonify({"error": "svg_url is required"}), 400
+
+        # 1) download svg
+        svg_bytes = download_svg(svg_url)
+
+        # 2) render svg -> PIL (RGBA)
+        rendered = svg_bytes_to_pil(svg_bytes, dpi=dpi)
+
+        # 3) place on KDP canvas
+        page_l = fit_on_kdp_canvas(rendered, format_kdp=format_kdp, dpi=dpi, margins_mm=margins_mm)
+
+        # 4) strict binarize (remove grays)
+        if binarize:
+            page_l = binarize_strict(page_l, threshold=threshold)
+
+        # 5) return PNG binary
+        buf = BytesIO()
+        page_l.save(buf, format="PNG", optimize=True)
+        buf.seek(0)
+        return send_file(buf, mimetype="image/png", as_attachment=False)
+
+    except requests.exceptions.RequestException as e:
+        return jsonify({"error": f"Failed to download SVG: {str(e)}"}), 400
+    except Exception as e:
+        # utile pour debug Make
+        return jsonify({"error": f"Processing error: {str(e)}"}), 500
 
 if __name__ == '__main__':
     import os
