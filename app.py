@@ -4,6 +4,7 @@ from PIL import Image
 import numpy as np
 from io import BytesIO
 import cv2
+import cairosvg
 
 app = Flask(__name__)
 
@@ -177,6 +178,87 @@ def list_formats():
         "formats": list(KDP_FORMATS.keys()),
         "cleaning_levels": ["Light", "Medium", "Strong", "Extreme"]
     })
+@app.route('/svg_to_png', methods=['POST'])
+def svg_to_png():
+    """
+    Convertit un SVG en PNG prêt pour KDP
+
+    Body JSON attendu :
+    {
+        "svg_url": "https://...",
+        "format": "8.5x11",
+        "dpi": 300,
+        "margins_mm": 0
+    }
+    """
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "No JSON data provided"}), 400
+
+        svg_url = data.get("svg_url")
+        format_kdp = data.get("format", "8.5x11")
+        dpi = int(data.get("dpi", 300))
+        margins_mm = float(data.get("margins_mm", 0))
+
+        if not svg_url:
+            return jsonify({"error": "svg_url is required"}), 400
+
+        if format_kdp not in KDP_FORMATS:
+            return jsonify({"error": f"Unsupported format {format_kdp}"}), 400
+
+        # Dimensions cible KDP
+        target = KDP_FORMATS[format_kdp]
+        width_px = target["width"]
+        height_px = target["height"]
+
+        # Marges en pixels
+        margin_px = int(margins_mm * dpi / 25.4)
+        usable_width = width_px - (2 * margin_px)
+        usable_height = height_px - (2 * margin_px)
+
+        if usable_width <= 0 or usable_height <= 0:
+            return jsonify({"error": "Margins too large for selected format"}), 400
+
+        # Télécharger le SVG
+        svg_response = requests.get(svg_url, timeout=60)
+        svg_response.raise_for_status()
+        svg_bytes = svg_response.content
+
+        # Rasterisation SVG → PNG (zone utile)
+        png_bytes = cairosvg.svg2png(
+            bytestring=svg_bytes,
+            output_width=usable_width,
+            output_height=usable_height,
+            dpi=dpi,
+            background_color="white"
+        )
+
+        # Charger PNG rasterisé
+        raster_img = Image.open(BytesIO(png_bytes)).convert("L")
+
+        # Image finale KDP (fond blanc)
+        final_img = Image.new("L", (width_px, height_px), 255)
+
+        x = (width_px - raster_img.width) // 2
+        y = (height_px - raster_img.height) // 2
+        final_img.paste(raster_img, (x, y))
+
+        # Export PNG
+        buffer = BytesIO()
+        final_img.save(buffer, format="PNG", optimize=True)
+        buffer.seek(0)
+
+        return send_file(
+            buffer,
+            mimetype="image/png",
+            as_attachment=False
+        )
+
+    except requests.exceptions.RequestException as e:
+        return jsonify({"error": f"Failed to download SVG: {str(e)}"}), 400
+    except Exception as e:
+        return jsonify({"error": f"SVG to PNG processing error: {str(e)}"}), 500
 
 if __name__ == '__main__':
     import os
