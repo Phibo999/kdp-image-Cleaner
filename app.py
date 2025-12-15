@@ -248,69 +248,7 @@ def list_formats():
         "cleaning_levels": ["Light", "Medium", "Strong", "Extreme"]
     })
 
-@app.route('/svg_to_png', methods=['POST'])
-def svg_to_png():
-    """
-    Convertit un SVG en PNG KDP-ready (Make compatible)
-    Reçoit JSON, renvoie PNG binaire
-    """
-    try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"error": "No JSON body"}), 400
 
-        svg_url = data.get("svg_url")
-        format_kdp = data.get("format", "8.5x11")
-        dpi = int(data.get("dpi", 300))
-        margins_mm = int(data.get("margins_mm", 0))
-
-        if not svg_url:
-            return jsonify({"error": "svg_url is required"}), 400
-
-        # Télécharger le SVG
-        r = requests.get(svg_url, timeout=60)
-        r.raise_for_status()
-        svg_data = r.content
-
-        # Dimensions KDP
-        if format_kdp not in KDP_FORMATS:
-            return jsonify({"error": "Invalid format"}), 400
-
-        target = KDP_FORMATS[format_kdp]
-        width_px = target["width"]
-        height_px = target["height"]
-
-        # Marges
-        margin_px = int(margins_mm * dpi / 25.4)
-        usable_w = width_px - (2 * margin_px)
-        usable_h = height_px - (2 * margin_px)
-
-        # Conversion SVG → PNG
-        png_bytes = cairosvg.svg2png(
-            bytestring=svg_data,
-            output_width=usable_w,
-            output_height=usable_h,
-            dpi=dpi,
-            background_color="white"
-        )
-
-        # Charger image
-        img = Image.open(BytesIO(png_bytes)).convert("L")
-
-        # Canvas final KDP
-        final_img = Image.new("L", (width_px, height_px), 255)
-        x = (width_px - img.width) // 2
-        y = (height_px - img.height) // 2
-        final_img.paste(img, (x, y))
-
-        buf = BytesIO()
-        final_img.save(buf, format="PNG", optimize=True)
-        buf.seek(0)
-
-        return send_file(buf, mimetype="image/png")
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
 def download_svg(url: str) -> bytes:
     """Télécharge un SVG depuis une URL et retourne les bytes."""
     r = requests.get(url, timeout=60)
