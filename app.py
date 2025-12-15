@@ -5,6 +5,7 @@ import numpy as np
 from io import BytesIO
 import cv2
 import cairosvg
+import re
 
 app = Flask(__name__)
 
@@ -18,6 +19,74 @@ KDP_FORMATS = {
     "6x6": {"width": 1800, "height": 1800},
     "8x8": {"width": 2400, "height": 2400},
 }
+def download_bytes(url: str) -> bytes:
+    """Télécharge du contenu binaire depuis une URL (SVG)"""
+    r = requests.get(url, timeout=60)
+    r.raise_for_status()
+    return r.content
+
+def parse_svg_ratio(svg_bytes: bytes) -> float:
+    """
+    Essaie de déduire le ratio largeur/hauteur du SVG.
+    Priorité: viewBox, sinon width/height si présents, sinon 1.0
+    """
+    try:
+        s = svg_bytes.decode("utf-8", errors="ignore")
+    except Exception:
+        return 1.0
+
+    # viewBox="minx miny w h"
+    m = re.search(r'viewBox\s*=\s*"[^"]*"', s, flags=re.IGNORECASE)
+    if m:
+        # extraire 4 nombres du viewBox
+        nums = re.findall(r"[-+]?\d*\.?\d+", m.group(0))
+        if len(nums) >= 4:
+            w = float(nums[2])
+            h = float(nums[3])
+            if h > 0:
+                return max(w / h, 0.0001)
+
+    # width="123px" height="456px"
+    mw = re.search(r'width\s*=\s*"([^"]+)"', s, flags=re.IGNORECASE)
+    mh = re.search(r'height\s*=\s*"([^"]+)"', s, flags=re.IGNORECASE)
+
+    def to_px(val: str) -> float:
+        # garde juste le nombre, ignore unités
+        n = re.findall(r"[-+]?\d*\.?\d+", val)
+        return float(n[0]) if n else 0.0
+
+    if mw and mh:
+        w = to_px(mw.group(1))
+        h = to_px(mh.group(1))
+        if h > 0 and w > 0:
+            return max(w / h, 0.0001)
+
+    return 1.0
+
+def kdp_target_pixels(format_kdp: str, dpi: int) -> tuple[int, int]:
+    """Calcule largeur/hauteur cible en pixels pour un format KDP à un DPI donné."""
+    # fallback si format inconnu
+    fmt = (format_kdp or "8.5x11").strip()
+    if fmt in KDP_FORMATS:
+        # Tu avais KDP_FORMATS en pixels à 300 DPI. On convertit proprement selon dpi.
+        base_w = KDP_FORMATS[fmt]["width"]
+        base_h = KDP_FORMATS[fmt]["height"]
+        scale = float(dpi) / 300.0
+        return int(round(base_w * scale)), int(round(base_h * scale))
+
+    # Sinon, tente de parser "8.5x11"
+    m = re.match(r"^\s*(\d+(\.\d+)?)\s*x\s*(\d+(\.\d+)?)\s*$", fmt)
+    if m:
+        w_in = float(m.group(1))
+        h_in = float(m.group(3))
+        return int(round(w_in * dpi)), int(round(h_in * dpi))
+
+    # fallback final
+    base_w = KDP_FORMATS["8.5x11"]["width"]
+    base_h = KDP_FORMATS["8.5x11"]["height"]
+    scale = float(dpi) / 300.0
+    return int(round(base_w * scale)), int(round(base_h * scale))
+
 
 def download_image(url):
     """Télécharge une image depuis une URL"""
@@ -178,87 +247,89 @@ def list_formats():
         "formats": list(KDP_FORMATS.keys()),
         "cleaning_levels": ["Light", "Medium", "Strong", "Extreme"]
     })
+
 @app.route('/svg_to_png', methods=['POST'])
 def svg_to_png():
     """
-    Convertit un SVG en PNG prêt pour KDP
+    Convertit un SVG (URL) en PNG binaire, redimensionné au format KDP (dpi) + marges.
 
-    Body JSON attendu :
+    Body JSON attendu (compatible Make):
     {
-        "svg_url": "https://...",
-        "format": "8.5x11",
-        "dpi": 300,
-        "margins_mm": 0
+      "svg_url": "https://....svg",
+      "format": "8.5x11",
+      "dpi": 300,
+      "margins_mm": 0
     }
+
+    Retour: image/png (binaire)
     """
     try:
-        data = request.get_json()
-        if not data:
-            return jsonify({"error": "No JSON data provided"}), 400
-
-        svg_url = data.get("svg_url")
+        data = request.get_json(silent=True) or {}
+        svg_url = data.get("svg_url") or data.get("input_url")  # tolérance si tu réutilises un champ
         format_kdp = data.get("format", "8.5x11")
-        dpi = int(data.get("dpi", 300))
-        margins_mm = float(data.get("margins_mm", 0))
+        dpi = int(data.get("dpi", 300) or 300)
+        margins_mm = float(data.get("margins_mm", 0) or 0)
 
         if not svg_url:
             return jsonify({"error": "svg_url is required"}), 400
 
-        if format_kdp not in KDP_FORMATS:
-            return jsonify({"error": f"Unsupported format {format_kdp}"}), 400
+        # bornes de sécurité
+        if dpi < 72:
+            dpi = 72
+        if dpi > 600:
+            dpi = 600
+        if margins_mm < 0:
+            margins_mm = 0
 
-        # Dimensions cible KDP
-        target = KDP_FORMATS[format_kdp]
-        width_px = target["width"]
-        height_px = target["height"]
+        target_w, target_h = kdp_target_pixels(format_kdp, dpi)
 
-        # Marges en pixels
-        margin_px = int(margins_mm * dpi / 25.4)
-        usable_width = width_px - (2 * margin_px)
-        usable_height = height_px - (2 * margin_px)
+        # marges en pixels
+        margin_px = int(round(margins_mm * dpi / 25.4))
+        usable_w = max(1, target_w - 2 * margin_px)
+        usable_h = max(1, target_h - 2 * margin_px)
 
-        if usable_width <= 0 or usable_height <= 0:
-            return jsonify({"error": "Margins too large for selected format"}), 400
+        # download svg
+        svg_bytes = download_bytes(svg_url)
 
-        # Télécharger le SVG
-        svg_response = requests.get(svg_url, timeout=60)
-        svg_response.raise_for_status()
-        svg_bytes = svg_response.content
+        # calc ratio pour "contain"
+        ratio = parse_svg_ratio(svg_bytes)
+        target_ratio = usable_w / usable_h
 
-        # Rasterisation SVG → PNG (zone utile)
-        png_bytes = cairosvg.svg2png(
+        if ratio > target_ratio:
+            render_w = usable_w
+            render_h = max(1, int(round(usable_w / ratio)))
+        else:
+            render_h = usable_h
+            render_w = max(1, int(round(usable_h * ratio)))
+
+        # render SVG -> PNG (RGBA)
+        rendered_png = cairosvg.svg2png(
             bytestring=svg_bytes,
-            output_width=usable_width,
-            output_height=usable_height,
-            dpi=dpi,
-            background_color="white"
+            output_width=render_w,
+            output_height=render_h
         )
 
-        # Charger PNG rasterisé
-        raster_img = Image.open(BytesIO(png_bytes)).convert("L")
+        # compose sur un fond blanc KDP
+        fg = Image.open(BytesIO(rendered_png)).convert("RGBA")
+        canvas = Image.new("RGB", (target_w, target_h), (255, 255, 255))
 
-        # Image finale KDP (fond blanc)
-        final_img = Image.new("L", (width_px, height_px), 255)
+        x = (target_w - fg.width) // 2
+        y = (target_h - fg.height) // 2
 
-        x = (width_px - raster_img.width) // 2
-        y = (height_px - raster_img.height) // 2
-        final_img.paste(raster_img, (x, y))
+        # alpha composite
+        canvas.paste(fg, (x, y), fg)
 
-        # Export PNG
-        buffer = BytesIO()
-        final_img.save(buffer, format="PNG", optimize=True)
-        buffer.seek(0)
+        out = BytesIO()
+        canvas.save(out, format="PNG", optimize=True)
+        out.seek(0)
 
-        return send_file(
-            buffer,
-            mimetype="image/png",
-            as_attachment=False
-        )
+        return send_file(out, mimetype="image/png", as_attachment=False)
 
     except requests.exceptions.RequestException as e:
-        return jsonify({"error": f"Failed to download SVG: {str(e)}"}), 400
+        return jsonify({"error": f"Failed to download svg: {str(e)}"}), 400
     except Exception as e:
-        return jsonify({"error": f"SVG to PNG processing error: {str(e)}"}), 500
+        return jsonify({"error": f"svg_to_png processing error: {str(e)}"}), 500
+
 
 if __name__ == '__main__':
     import os
