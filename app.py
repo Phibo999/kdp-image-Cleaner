@@ -19,11 +19,17 @@ KDP_FORMATS = {
     "6x6": {"width": 1800, "height": 1800},
     "8x8": {"width": 2400, "height": 2400},
 }
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FONCTIONS UTILITAIRES
+# ═══════════════════════════════════════════════════════════════════════════════
+
 def download_bytes(url: str) -> bytes:
     """Télécharge du contenu binaire depuis une URL (SVG)"""
     r = requests.get(url, timeout=60)
     r.raise_for_status()
     return r.content
+
 
 def parse_svg_ratio(svg_bytes: bytes) -> float:
     """
@@ -38,7 +44,6 @@ def parse_svg_ratio(svg_bytes: bytes) -> float:
     # viewBox="minx miny w h"
     m = re.search(r'viewBox\s*=\s*"[^"]*"', s, flags=re.IGNORECASE)
     if m:
-        # extraire 4 nombres du viewBox
         nums = re.findall(r"[-+]?\d*\.?\d+", m.group(0))
         if len(nums) >= 4:
             w = float(nums[2])
@@ -51,7 +56,6 @@ def parse_svg_ratio(svg_bytes: bytes) -> float:
     mh = re.search(r'height\s*=\s*"([^"]+)"', s, flags=re.IGNORECASE)
 
     def to_px(val: str) -> float:
-        # garde juste le nombre, ignore unités
         n = re.findall(r"[-+]?\d*\.?\d+", val)
         return float(n[0]) if n else 0.0
 
@@ -63,25 +67,22 @@ def parse_svg_ratio(svg_bytes: bytes) -> float:
 
     return 1.0
 
+
 def kdp_target_pixels(format_kdp: str, dpi: int) -> tuple[int, int]:
     """Calcule largeur/hauteur cible en pixels pour un format KDP à un DPI donné."""
-    # fallback si format inconnu
     fmt = (format_kdp or "8.5x11").strip()
     if fmt in KDP_FORMATS:
-        # Tu avais KDP_FORMATS en pixels à 300 DPI. On convertit proprement selon dpi.
         base_w = KDP_FORMATS[fmt]["width"]
         base_h = KDP_FORMATS[fmt]["height"]
         scale = float(dpi) / 300.0
         return int(round(base_w * scale)), int(round(base_h * scale))
 
-    # Sinon, tente de parser "8.5x11"
     m = re.match(r"^\s*(\d+(\.\d+)?)\s*x\s*(\d+(\.\d+)?)\s*$", fmt)
     if m:
         w_in = float(m.group(1))
         h_in = float(m.group(3))
         return int(round(w_in * dpi)), int(round(h_in * dpi))
 
-    # fallback final
     base_w = KDP_FORMATS["8.5x11"]["width"]
     base_h = KDP_FORMATS["8.5x11"]["height"]
     scale = float(dpi) / 300.0
@@ -94,14 +95,57 @@ def download_image(url):
     response.raise_for_status()
     return Image.open(BytesIO(response.content))
 
-def clean_image(img, cleaning_strength="Medium"):
-    """Nettoie l'image : supprime les gris, le bruit, etc."""
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FONCTION DE NETTOYAGE AMÉLIORÉE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def clean_image(img, cleaning_strength="Medium", denoise_level=0, line_boost_px=0):
+    """
+    Nettoie l'image : supprime les gris, le bruit, etc.
+    
+    Paramètres:
+    -----------
+    - img: Image PIL
+    - cleaning_strength: "Light", "Medium", "Strong", "Extreme"
+    - denoise_level: 0-10 (0 = désactivé, 10 = maximum) - NOUVEAU
+    - line_boost_px: 0-10 pixels d'épaississement (0 = désactivé) - NOUVEAU
+    
+    Retourne:
+    ---------
+    - Image PIL nettoyée (mode L, niveaux de gris)
+    """
     
     # Convertir en numpy array
     img_array = np.array(img.convert('RGB'))
     
     # Convertir en niveaux de gris
     gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ÉTAPE 1 : DÉBRUITAGE AVANCÉ (NOUVEAU)
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Utilise fastNlMeansDenoising - meilleur que morphologie pour les textures
+    # Appliqué AVANT la binarisation pour de meilleurs résultats
+    
+    if denoise_level > 0:
+        # Force du débruitage : 3-30 selon le niveau (0-10)
+        # h = force de filtrage (plus élevé = plus de débruitage mais perte de détails)
+        h = 3 + (denoise_level * 2.7)  # 3 à 30
+        
+        # templateWindowSize : taille du patch pour comparaison (doit être impair)
+        # searchWindowSize : zone de recherche (doit être impair)
+        gray = cv2.fastNlMeansDenoising(
+            gray, 
+            None, 
+            h=h, 
+            templateWindowSize=7, 
+            searchWindowSize=21
+        )
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ÉTAPE 2 : BINARISATION (existant)
+    # ═══════════════════════════════════════════════════════════════════════════
     
     # Définir les seuils selon la force de nettoyage
     thresholds = {
@@ -115,6 +159,10 @@ def clean_image(img, cleaning_strength="Medium"):
     # Appliquer le seuillage pour obtenir du noir et blanc pur
     _, binary = cv2.threshold(gray, threshold, 255, cv2.THRESH_BINARY)
     
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ÉTAPE 3 : NETTOYAGE MORPHOLOGIQUE (existant)
+    # ═══════════════════════════════════════════════════════════════════════════
+    
     # Supprimer le bruit avec des opérations morphologiques
     kernel = np.ones((2, 2), np.uint8)
     
@@ -123,6 +171,10 @@ def clean_image(img, cleaning_strength="Medium"):
     
     # Fermeture pour combler les petits trous dans les lignes
     cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel)
+    
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ÉTAPE 4 : SUPPRESSION DES ARTEFACTS ISOLÉS (existant)
+    # ═══════════════════════════════════════════════════════════════════════════
     
     # Supprimer les petits artefacts isolés
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
@@ -138,7 +190,33 @@ def clean_image(img, cleaning_strength="Medium"):
     
     cleaned = mask
     
+    # ═══════════════════════════════════════════════════════════════════════════
+    # ÉTAPE 5 : ÉPAISSISSEMENT DES TRAITS (NOUVEAU)
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Dilate les traits noirs pour améliorer la vectorisation et l'imprimabilité
+    
+    if line_boost_px > 0:
+        # Borner la valeur
+        line_boost_px = max(1, min(10, line_boost_px))
+        
+        # Inverser : les traits noirs deviennent blancs (pour dilatation)
+        inverted = cv2.bitwise_not(cleaned)
+        
+        # Kernel circulaire (ellipse) - préserve mieux les détails que carré
+        kernel_size = line_boost_px * 2 + 1
+        kernel_boost = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, 
+            (kernel_size, kernel_size)
+        )
+        
+        # Dilater (épaissir les traits blancs = futurs traits noirs)
+        dilated = cv2.dilate(inverted, kernel_boost, iterations=1)
+        
+        # Ré-inverser pour retrouver noir sur blanc
+        cleaned = cv2.bitwise_not(dilated)
+    
     return Image.fromarray(cleaned)
+
 
 def resize_for_kdp(img, format_kdp, margins_mm=5):
     """Redimensionne l'image pour le format KDP avec marges"""
@@ -160,11 +238,9 @@ def resize_for_kdp(img, format_kdp, margins_mm=5):
     target_ratio = usable_width / usable_height
     
     if img_ratio > target_ratio:
-        # Image plus large : ajuster par la largeur
         new_width = usable_width
         new_height = int(usable_width / img_ratio)
     else:
-        # Image plus haute : ajuster par la hauteur
         new_height = usable_height
         new_width = int(usable_height * img_ratio)
     
@@ -182,10 +258,20 @@ def resize_for_kdp(img, format_kdp, margins_mm=5):
     
     return final_img
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ENDPOINTS
+# ═══════════════════════════════════════════════════════════════════════════════
+
 @app.route('/health', methods=['GET'])
 def health_check():
     """Endpoint de vérification de santé"""
-    return jsonify({"status": "healthy", "service": "KDP Image Cleaner"})
+    return jsonify({
+        "status": "healthy", 
+        "service": "KDP Image Cleaner",
+        "version": "2.0.0"  # Mise à jour version
+    })
+
 
 @app.route('/clean-kdp-image', methods=['POST'])
 def clean_kdp_image():
@@ -198,7 +284,9 @@ def clean_kdp_image():
         "format": "8.5x11",
         "cleaning": "Medium",
         "margins_mm": 5,
-        "vectorize": false
+        "vectorize": false,
+        "denoise_level": 2,      // NOUVEAU: 0-10 (0=off, 10=max)
+        "line_boost_px": 0       // NOUVEAU: 0-10 (0=off, pixels à ajouter)
     }
     """
     try:
@@ -212,14 +300,27 @@ def clean_kdp_image():
         cleaning_strength = data.get('cleaning', 'Medium')
         margins_mm = data.get('margins_mm', 5)
         
+        # NOUVEAUX PARAMÈTRES
+        denoise_level = int(data.get('denoise_level', 0))  # Défaut: désactivé
+        line_boost_px = int(data.get('line_boost_px', 0))  # Défaut: désactivé
+        
+        # Borner les valeurs
+        denoise_level = max(0, min(10, denoise_level))
+        line_boost_px = max(0, min(10, line_boost_px))
+        
         if not input_url:
             return jsonify({"error": "input_url is required"}), 400
         
         # 1. Télécharger l'image
         img = download_image(input_url)
         
-        # 2. Nettoyer l'image
-        cleaned_img = clean_image(img, cleaning_strength)
+        # 2. Nettoyer l'image (avec nouveaux paramètres)
+        cleaned_img = clean_image(
+            img, 
+            cleaning_strength,
+            denoise_level=denoise_level,
+            line_boost_px=line_boost_px
+        )
         
         # 3. Redimensionner pour KDP
         final_img = resize_for_kdp(cleaned_img, format_kdp, margins_mm)
@@ -240,14 +341,35 @@ def clean_kdp_image():
     except Exception as e:
         return jsonify({"error": f"Processing error: {str(e)}"}), 500
 
+
 @app.route('/formats', methods=['GET'])
 def list_formats():
-    """Liste les formats KDP disponibles"""
+    """Liste les formats KDP disponibles et les options"""
     return jsonify({
         "formats": list(KDP_FORMATS.keys()),
-        "cleaning_levels": ["Light", "Medium", "Strong", "Extreme"]
+        "cleaning_levels": ["Light", "Medium", "Strong", "Extreme"],
+        "options": {
+            "denoise_level": {
+                "description": "Niveau de débruitage avancé",
+                "min": 0,
+                "max": 10,
+                "default": 0,
+                "note": "0 = désactivé, 10 = maximum"
+            },
+            "line_boost_px": {
+                "description": "Épaississement des traits en pixels",
+                "min": 0,
+                "max": 10,
+                "default": 0,
+                "note": "0 = désactivé, 2-3 recommandé pour KDP"
+            }
+        }
     })
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FONCTIONS SVG TO PNG
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def download_svg(url: str) -> bytes:
     """Télécharge un SVG depuis une URL et retourne les bytes."""
@@ -255,19 +377,22 @@ def download_svg(url: str) -> bytes:
     r.raise_for_status()
     return r.content
 
+
 def _normalize_dpi(dpi):
     try:
         dpi = int(dpi)
     except Exception:
         dpi = 300
-    return max(72, min(dpi, 1200))  # bornes raisonnables
+    return max(72, min(dpi, 1200))
+
 
 def _normalize_margins_mm(margins_mm):
     try:
         margins_mm = float(margins_mm)
     except Exception:
         margins_mm = 0.0
-    return max(0.0, min(margins_mm, 25.0))  # bornes raisonnables
+    return max(0.0, min(margins_mm, 25.0))
+
 
 def svg_bytes_to_pil(svg_bytes: bytes, dpi: int) -> Image.Image:
     """
@@ -277,14 +402,13 @@ def svg_bytes_to_pil(svg_bytes: bytes, dpi: int) -> Image.Image:
     png_bytes = cairosvg.svg2png(bytestring=svg_bytes, dpi=dpi)
     return Image.open(BytesIO(png_bytes)).convert("RGBA")
 
+
 def fit_on_kdp_canvas(img_rgba: Image.Image, format_kdp: str, dpi: int, margins_mm: float) -> Image.Image:
     """
     Place l'image rendue (RGBA) au centre d'une page KDP (fond blanc),
     en respectant format + dpi + marges, en conservant le ratio.
     Retourne une image L (niveaux de gris) prête à binariser.
     """
-    # Dimensions page en px pour le dpi demandé
-    # On part de tes formats définis en 300dpi, puis on scale au dpi voulu.
     if format_kdp not in KDP_FORMATS:
         format_kdp = "8.5x11"
 
@@ -322,14 +446,16 @@ def fit_on_kdp_canvas(img_rgba: Image.Image, format_kdp: str, dpi: int, margins_
 
     return canvas.convert("L")
 
+
 def binarize_strict(img_l: Image.Image, threshold: int = 245) -> Image.Image:
     """
-    Binarisation agressive pour supprimer l’anti-aliasing (gris) issu du rendu SVG.
+    Binarisation agressive pour supprimer l'anti-aliasing (gris) issu du rendu SVG.
     0 = noir, 255 = blanc.
     """
     arr = np.array(img_l)
     arr = np.where(arr < threshold, 0, 255).astype(np.uint8)
     return Image.fromarray(arr, mode="L")
+
 
 @app.route('/svg_to_png', methods=['POST'])
 def svg_to_png():
@@ -383,8 +509,12 @@ def svg_to_png():
     except requests.exceptions.RequestException as e:
         return jsonify({"error": f"Failed to download SVG: {str(e)}"}), 400
     except Exception as e:
-        # utile pour debug Make
         return jsonify({"error": f"Processing error: {str(e)}"}), 500
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == '__main__':
     import os
