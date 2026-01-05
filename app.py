@@ -6,6 +6,7 @@ from io import BytesIO
 import cv2
 import cairosvg
 import re
+import base64  # NOUVEAU
 
 app = Flask(__name__)
 
@@ -94,6 +95,49 @@ def download_image(url):
     response = requests.get(url, timeout=60)
     response.raise_for_status()
     return Image.open(BytesIO(response.content))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# NOUVELLE FONCTION : Récupération image (base64 OU URL)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def get_image_from_request(data: dict) -> Image.Image:
+    """
+    Récupère l'image soit depuis base64 (prioritaire), soit depuis une URL.
+    
+    Paramètres attendus dans data:
+    - input_base64: string base64 de l'image (PRIORITAIRE)
+    - input_url: URL de l'image (fallback)
+    
+    Retourne:
+    - PIL.Image
+    """
+    
+    # Option 1 : Base64 (prioritaire - plus fiable, pas de blocage Google)
+    if data.get('input_base64'):
+        try:
+            # Nettoyer le base64 si préfixe data:image/...
+            b64_data = data['input_base64']
+            if ',' in b64_data:
+                b64_data = b64_data.split(',')[1]
+            
+            # Décoder
+            image_bytes = base64.b64decode(b64_data)
+            return Image.open(BytesIO(image_bytes))
+        except Exception as e:
+            raise ValueError(f"Erreur décodage base64: {str(e)}")
+    
+    # Option 2 : URL (fallback)
+    elif data.get('input_url'):
+        try:
+            response = requests.get(data['input_url'], timeout=60)
+            response.raise_for_status()
+            return Image.open(BytesIO(response.content))
+        except Exception as e:
+            raise ValueError(f"Erreur téléchargement URL: {str(e)}")
+    
+    else:
+        raise ValueError("Aucune source d'image fournie (input_base64 ou input_url requis)")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -269,7 +313,7 @@ def health_check():
     return jsonify({
         "status": "healthy", 
         "service": "KDP Image Cleaner",
-        "version": "2.0.0"  # Mise à jour version
+        "version": "2.1.0"  # MISE À JOUR VERSION - Support base64
     })
 
 
@@ -280,14 +324,18 @@ def clean_kdp_image():
     
     Body JSON attendu:
     {
-        "input_url": "https://...",
+        "input_base64": "iVBORw0KGgo...",  // NOUVEAU (prioritaire)
+        "input_url": "https://...",         // Fallback si pas de base64
         "format": "8.5x11",
         "cleaning": "Medium",
         "margins_mm": 5,
         "vectorize": false,
-        "denoise_level": 2,      // NOUVEAU: 0-10 (0=off, 10=max)
-        "line_boost_px": 0       // NOUVEAU: 0-10 (0=off, pixels à ajouter)
+        "denoise_level": 2,
+        "line_boost_px": 0
     }
+    
+    Note: input_base64 est prioritaire sur input_url s'il est fourni.
+    Cela évite les problèmes de blocage Google Drive.
     """
     try:
         data = request.get_json()
@@ -295,24 +343,24 @@ def clean_kdp_image():
         if not data:
             return jsonify({"error": "No JSON data provided"}), 400
         
-        input_url = data.get('input_url')
         format_kdp = data.get('format', '8.5x11')
         cleaning_strength = data.get('cleaning', 'Medium')
         margins_mm = data.get('margins_mm', 5)
         
         # NOUVEAUX PARAMÈTRES
-        denoise_level = int(data.get('denoise_level', 0))  # Défaut: désactivé
-        line_boost_px = int(data.get('line_boost_px', 0))  # Défaut: désactivé
+        denoise_level = int(data.get('denoise_level', 0))
+        line_boost_px = int(data.get('line_boost_px', 0))
         
         # Borner les valeurs
         denoise_level = max(0, min(10, denoise_level))
         line_boost_px = max(0, min(10, line_boost_px))
         
-        if not input_url:
-            return jsonify({"error": "input_url is required"}), 400
+        # Vérifier qu'au moins une source est fournie
+        if not data.get('input_base64') and not data.get('input_url'):
+            return jsonify({"error": "input_base64 ou input_url requis"}), 400
         
-        # 1. Télécharger l'image
-        img = download_image(input_url)
+        # 1. Récupérer l'image (base64 prioritaire, sinon URL)
+        img = get_image_from_request(data)
         
         # 2. Nettoyer l'image (avec nouveaux paramètres)
         cleaned_img = clean_image(
@@ -336,6 +384,9 @@ def clean_kdp_image():
             as_attachment=False
         )
         
+    except ValueError as e:
+        # Erreurs de validation (base64 invalide, URL inaccessible, etc.)
+        return jsonify({"error": str(e)}), 400
     except requests.exceptions.RequestException as e:
         return jsonify({"error": f"Failed to download image: {str(e)}"}), 400
     except Exception as e:
@@ -363,6 +414,10 @@ def list_formats():
                 "default": 0,
                 "note": "0 = désactivé, 2-3 recommandé pour KDP"
             }
+        },
+        "input_methods": {
+            "input_base64": "Image encodée en base64 (RECOMMANDÉ - évite blocages Google)",
+            "input_url": "URL directe de l'image (fallback)"
         }
     })
 
