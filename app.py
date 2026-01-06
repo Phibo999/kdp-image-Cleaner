@@ -6,7 +6,7 @@ from io import BytesIO
 import cv2
 import cairosvg
 import re
-import base64  # NOUVEAU
+import base64
 
 app = Flask(__name__)
 
@@ -138,6 +138,76 @@ def get_image_from_request(data: dict) -> Image.Image:
     
     else:
         raise ValueError("Aucune source d'image fournie (input_base64 ou input_url requis)")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# NOUVELLE FONCTION : Récupération SVG (base64 OU URL)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def get_svg_from_request(data: dict) -> bytes:
+    """
+    Récupère le SVG soit depuis base64 (prioritaire), soit depuis une URL.
+    
+    Paramètres attendus dans data:
+    - svg_base64: string base64 du SVG (PRIORITAIRE)
+    - svg_url: URL du SVG (fallback)
+    
+    Retourne:
+    - bytes du contenu SVG
+    """
+    
+    # Option 1 : Base64 (prioritaire - plus fiable, pas de blocage Google)
+    if data.get('svg_base64'):
+        try:
+            # Nettoyer le base64 si préfixe data:image/...
+            b64_data = data['svg_base64']
+            if ',' in b64_data:
+                b64_data = b64_data.split(',')[1]
+            
+            # Décoder
+            svg_bytes = base64.b64decode(b64_data)
+            
+            # Vérifier que c'est bien du SVG
+            svg_str = svg_bytes.decode('utf-8', errors='ignore').lower()
+            if '<svg' not in svg_str:
+                raise ValueError("Le contenu base64 ne semble pas être un SVG valide")
+            
+            return svg_bytes
+            
+        except ValueError:
+            raise
+        except Exception as e:
+            raise ValueError(f"Erreur décodage base64 SVG: {str(e)}")
+    
+    # Option 2 : URL (fallback)
+    elif data.get('svg_url'):
+        try:
+            response = requests.get(data['svg_url'], timeout=60)
+            response.raise_for_status()
+            svg_bytes = response.content
+            
+            # Vérifier que c'est bien du SVG (pas une page HTML Google)
+            content_start = svg_bytes[:200].decode('utf-8', errors='ignore').lower()
+            
+            if '<html' in content_start or '<!doctype html' in content_start:
+                raise ValueError(
+                    "L'URL retourne une page HTML au lieu du SVG. "
+                    "Google Drive bloque le téléchargement direct. "
+                    "Utilisez svg_base64 à la place."
+                )
+            
+            if '<svg' not in content_start and '<?xml' not in content_start:
+                raise ValueError("Le contenu téléchargé ne semble pas être un SVG valide")
+            
+            return svg_bytes
+            
+        except ValueError:
+            raise
+        except requests.exceptions.RequestException as e:
+            raise ValueError(f"Erreur téléchargement SVG: {str(e)}")
+    
+    else:
+        raise ValueError("Aucune source SVG fournie (svg_base64 ou svg_url requis)")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -313,7 +383,7 @@ def health_check():
     return jsonify({
         "status": "healthy", 
         "service": "KDP Image Cleaner",
-        "version": "2.1.0"  # MISE À JOUR VERSION - Support base64
+        "version": "2.2.0"  # MISE À JOUR VERSION - Support svg_base64
     })
 
 
@@ -324,7 +394,7 @@ def clean_kdp_image():
     
     Body JSON attendu:
     {
-        "input_base64": "iVBORw0KGgo...",  // NOUVEAU (prioritaire)
+        "input_base64": "iVBORw0KGgo...",  // PRIORITAIRE
         "input_url": "https://...",         // Fallback si pas de base64
         "format": "8.5x11",
         "cleaning": "Medium",
@@ -515,35 +585,42 @@ def binarize_strict(img_l: Image.Image, threshold: int = 245) -> Image.Image:
 @app.route('/svg_to_png', methods=['POST'])
 def svg_to_png():
     """
-    Convertit un SVG (URL) en PNG binaire, KDP-ready.
+    Convertit un SVG en PNG binaire, KDP-ready.
+    
+    MISE À JOUR v2.2.0: Accepte svg_base64 OU svg_url
+    svg_base64 est PRIORITAIRE (évite les blocages Google Drive)
 
     Body JSON attendu:
     {
-      "svg_url": "https://drive.google.com/uc?id=...&export=download",
+      "svg_base64": "PHN2ZyB4bWxucz0i...",  // PRIORITAIRE - SVG encodé en base64
+      "svg_url": "https://...",              // Fallback si pas de base64
       "format": "8.5x11",
       "dpi": 300,
       "margins_mm": 0,
       "binarize": true,
       "threshold": 245
     }
+    
+    Note: Utilisez svg_base64 pour éviter les problèmes de téléchargement
+    depuis Google Drive (pages HTML au lieu du fichier).
     """
     try:
         data = request.get_json()
         if not data:
             return jsonify({"error": "No JSON data provided"}), 400
 
-        svg_url = data.get("svg_url")
         format_kdp = data.get("format", "8.5x11")
         dpi = _normalize_dpi(data.get("dpi", 300))
         margins_mm = _normalize_margins_mm(data.get("margins_mm", 0))
         binarize = bool(data.get("binarize", True))
         threshold = int(data.get("threshold", 245))
 
-        if not svg_url:
-            return jsonify({"error": "svg_url is required"}), 400
+        # Vérifier qu'au moins une source est fournie
+        if not data.get('svg_base64') and not data.get('svg_url'):
+            return jsonify({"error": "svg_base64 ou svg_url requis"}), 400
 
-        # 1) download svg
-        svg_bytes = download_svg(svg_url)
+        # 1) Récupérer le SVG (base64 prioritaire, sinon URL)
+        svg_bytes = get_svg_from_request(data)
 
         # 2) render svg -> PIL (RGBA)
         rendered = svg_bytes_to_pil(svg_bytes, dpi=dpi)
@@ -561,6 +638,9 @@ def svg_to_png():
         buf.seek(0)
         return send_file(buf, mimetype="image/png", as_attachment=False)
 
+    except ValueError as e:
+        # Erreurs de validation (base64 invalide, URL inaccessible, HTML reçu, etc.)
+        return jsonify({"error": str(e)}), 400
     except requests.exceptions.RequestException as e:
         return jsonify({"error": f"Failed to download SVG: {str(e)}"}), 400
     except Exception as e:
@@ -575,3 +655,4 @@ if __name__ == '__main__':
     import os
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
+
