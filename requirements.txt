@@ -5,3 +5,4 @@ numpy==1.26.2
 opencv-python-headless==4.10.0.84
 requests==2.31.0
 cairosvg==2.7.1
+lxml==5.1.0
