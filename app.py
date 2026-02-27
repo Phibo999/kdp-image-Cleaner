@@ -7,6 +7,7 @@ import cv2
 import cairosvg
 import re
 import base64
+from lxml import etree
 from typing import Tuple, Dict, Optional
 import logging
 
@@ -1149,10 +1150,147 @@ def binarize_strict(img_l: Image.Image, threshold: int = 245) -> Image.Image:
     return Image.fromarray(arr, mode="L")
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# SVG STROKE WIDTH ADJUSTMENT — Épaississement vectoriel V2
+# ═══════════════════════════════════════════════════════════════════════════════
+
+SVG_NS = "http://www.w3.org/2000/svg"
+
+# Couleurs considérées comme "fond" (à ignorer)
+_IGNORE_FILLS = frozenset({"none", "white", "#fff", "#ffffff", "transparent", ""})
+
+# Couleurs considérées comme "ligne noire"
+_BLACK_FILLS = frozenset({
+    "black", "#000", "#000000", "#111", "#111111", "#222", "#222222",
+    "#333", "#333333", "#1a1a1a", "#0a0a0a", "rgb(0,0,0)"
+})
+
+# Éléments SVG visuels qui peuvent porter un stroke
+_VISUAL_TAGS = frozenset({
+    "path", "polygon", "polyline", "circle", "ellipse", "rect", "line"
+})
+
+
+def _parse_svg_viewbox(svg_root):
+    """Extrait (width, height) depuis le viewBox ou les attributs width/height."""
+    viewbox = svg_root.get("viewBox")
+    if viewbox:
+        parts = viewbox.strip().split()
+        if len(parts) == 4:
+            return float(parts[2]), float(parts[3])
+    # Fallback
+    w = float(re.sub(r'[^0-9.]', '', svg_root.get("width", "0")) or 0)
+    h = float(re.sub(r'[^0-9.]', '', svg_root.get("height", "0")) or 0)
+    return w, h
+
+
+def _mm_to_svg_units(mm_value, svg_w, svg_h, target_w_px, target_h_px, dpi):
+    """
+    Convertit mm → unités SVG.
+    mm → pixels (mm * dpi / 25.4) → unités SVG (pixels * svg_units / target_pixels)
+    """
+    mm_in_px = mm_value * dpi / 25.4
+    scale_x = svg_w / target_w_px if target_w_px > 0 else 1
+    scale_y = svg_h / target_h_px if target_h_px > 0 else 1
+    return mm_in_px * (scale_x + scale_y) / 2
+
+
+def adjust_svg_strokes(svg_bytes: bytes, stroke_width_mm: float,
+                       dpi: int, content_w_px: int, content_h_px: int) -> bytes:
+    """
+    Épaissit les traits d'un SVG vectorisé par Recraft.
+    
+    Les SVG Recraft sont "fill-based" : les lignes noires sont des <path> 
+    avec fill="#000" et pas de stroke. On ajoute un stroke noir autour de 
+    chaque forme noire → les lignes grossissent vers l'extérieur.
+    
+    Pour les SVG stroke-based : on ajuste le stroke-width existant.
+    
+    Args:
+        svg_bytes:        SVG brut en bytes
+        stroke_width_mm:  épaisseur cible en mm (ex: 0.40)
+        dpi:              résolution de sortie (pour la conversion mm→SVG units)
+        content_w_px:     largeur zone de contenu en pixels
+        content_h_px:     hauteur zone de contenu en pixels
+    
+    Returns:
+        SVG modifié en bytes
+    """
+    parser = etree.XMLParser(remove_blank_text=True)
+    tree = etree.fromstring(svg_bytes, parser)
+
+    svg_w, svg_h = _parse_svg_viewbox(tree)
+    if svg_w == 0 or svg_h == 0:
+        logger.warning("[SVG STROKE] Dimensions SVG introuvables, skip")
+        return svg_bytes
+
+    stroke_val = _mm_to_svg_units(
+        stroke_width_mm, svg_w, svg_h, content_w_px, content_h_px, dpi
+    )
+    stroke_str = f"{stroke_val:.4f}"
+
+    modified_fill = 0
+    modified_stroke = 0
+
+    for elem in tree.iter():
+        tag = etree.QName(elem.tag).localname if isinstance(elem.tag, str) else ""
+        if tag not in _VISUAL_TAGS:
+            continue
+
+        fill = elem.get("fill", "").strip().lower()
+        stroke = elem.get("stroke", "").strip().lower()
+        style = elem.get("style", "")
+
+        # Parser style inline si présent
+        style_dict = {}
+        if style:
+            for part in style.split(";"):
+                if ":" in part:
+                    k, v = part.split(":", 1)
+                    style_dict[k.strip().lower()] = v.strip().lower()
+
+        eff_fill = style_dict.get("fill", fill)
+        eff_stroke = style_dict.get("stroke", stroke)
+
+        # CAS 1 : Path fill-based (Recraft) — fill noir, pas de stroke
+        if eff_fill and eff_fill not in _IGNORE_FILLS:
+            if eff_stroke in ("", "none") or eff_stroke in _IGNORE_FILLS:
+                color = "#000000" if eff_fill in _BLACK_FILLS else eff_fill
+                if style:
+                    elem.set("style", style.rstrip(";") +
+                             f"; stroke: {color}; stroke-width: {stroke_str}"
+                             f"; stroke-linejoin: round; stroke-linecap: round")
+                else:
+                    elem.set("stroke", color)
+                    elem.set("stroke-width", stroke_str)
+                    elem.set("stroke-linejoin", "round")
+                    elem.set("stroke-linecap", "round")
+                modified_fill += 1
+                continue
+
+        # CAS 2 : Path stroke-based — ajuster le stroke-width existant
+        if eff_stroke and eff_stroke not in _IGNORE_FILLS:
+            if "stroke-width" in style_dict:
+                elem.set("style", re.sub(
+                    r'stroke-width\s*:\s*[^;]+',
+                    f'stroke-width: {stroke_str}',
+                    style
+                ))
+            else:
+                elem.set("stroke-width", stroke_str)
+            modified_stroke += 1
+
+    logger.info(f"[SVG STROKE] {stroke_width_mm}mm = {stroke_str} SVG units | "
+                f"fill-based: {modified_fill}, stroke-based: {modified_stroke}")
+
+    return etree.tostring(tree, xml_declaration=True, encoding="unicode").encode("utf-8")
+
+
 @app.route('/svg_to_png', methods=['POST'])
 def svg_to_png():
     """
     Convertit un SVG en PNG binaire, KDP-ready.
+    V2 : supporte stroke_width_mm pour épaississement vectoriel.
     
     Body JSON attendu:
     {
@@ -1162,7 +1300,8 @@ def svg_to_png():
       "dpi": 300,
       "margins_mm": 0,
       "binarize": true,
-      "threshold": 245
+      "threshold": 245,
+      "stroke_width_mm": 0.40               // ⭐ NOUVEAU — 0 = désactivé
     }
     """
     try:
@@ -1175,6 +1314,7 @@ def svg_to_png():
         margins_mm = _normalize_margins_mm(data.get("margins_mm", 0))
         binarize = bool(data.get("binarize", True))
         threshold = int(data.get("threshold", 245))
+        stroke_width_mm = float(data.get("stroke_width_mm", 0))  # ⭐ V2
 
         if not data.get('svg_base64') and not data.get('svg_url'):
             return jsonify({"error": "svg_base64 ou svg_url requis"}), 400
@@ -1182,17 +1322,36 @@ def svg_to_png():
         # 1) Récupérer le SVG
         svg_bytes = get_svg_from_request(data)
 
-        # 2) render svg -> PIL (RGBA)
+        # 2) ⭐ Épaississement vectoriel (si demandé)
+        if stroke_width_mm > 0:
+            # Calculer les dimensions du contenu pour la conversion mm→SVG units
+            if format_kdp not in KDP_FORMATS:
+                fmt = KDP_FORMATS["8.5x11"]
+            else:
+                fmt = KDP_FORMATS[format_kdp]
+            scale = dpi / 300.0
+            page_w = int(round(fmt["width"] * scale))
+            page_h = int(round(fmt["height"] * scale))
+            margin_px = int(round(margins_mm * dpi / 25.4))
+            content_w = max(1, page_w - 2 * margin_px)
+            content_h = max(1, page_h - 2 * margin_px)
+            
+            svg_bytes = adjust_svg_strokes(
+                svg_bytes, stroke_width_mm, dpi, content_w, content_h
+            )
+            logger.info(f"[SVG_TO_PNG] Traits épaissis à {stroke_width_mm}mm")
+
+        # 3) render svg -> PIL (RGBA)
         rendered = svg_bytes_to_pil(svg_bytes, dpi=dpi)
 
-        # 3) place on KDP canvas
+        # 4) place on KDP canvas
         page_l = fit_on_kdp_canvas(rendered, format_kdp=format_kdp, dpi=dpi, margins_mm=margins_mm)
 
-        # 4) strict binarize
+        # 5) strict binarize
         if binarize:
             page_l = binarize_strict(page_l, threshold=threshold)
 
-        # 5) return PNG binary
+        # 6) return PNG binary
         buf = BytesIO()
         page_l.save(buf, format="PNG", optimize=True)
         buf.seek(0)
